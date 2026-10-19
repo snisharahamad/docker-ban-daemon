@@ -1,0 +1,11 @@
+{
+  "client_name": "NOM_DU_CLIENT",
+  "target_container": "traefik-proxy",
+  "ollama_url": "http://localhost:11434/api/generate",
+  "llm_model": "llama3.2",
+  "discord_webhook": "URL_WEBHOOK_ICI",
+  "ban_duration_minutes": 60,
+  "metrics_port": "127.0.0.1:9090",
+  "whitelisted_ips": ["127.0.0.1"],
+  "regex_pattern": "(?i)(union\\s+select|[;&|]|%3B|%26|%7C)\\s*(id|whoami|wget|curl|cat)|(\\/|%2F)etc(\\/|%2F)passwd|(\\.\\.%2F|\\.\\.\\/)"
+}

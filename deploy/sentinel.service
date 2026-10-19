@@ -1,0 +1,14 @@
+[Unit]
+Description=Sentinel-Zero DevSecOps Autonomous Agent (V4.0)
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sentinel-agent
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
