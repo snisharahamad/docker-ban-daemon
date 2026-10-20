@@ -2,7 +2,10 @@ module github.com/snisharahamad/sentinel-zero/agent-go
 
 go 1.26.0
 
-require github.com/docker/docker v28.5.2+incompatible
+require (
+	github.com/docker/docker v28.5.2+incompatible
+	github.com/mattn/go-sqlite3 v1.14.52
+)
 
 require (
 	github.com/Microsoft/go-winio v0.6.4 // indirect

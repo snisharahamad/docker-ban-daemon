@@ -1,386 +1,329 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"net/http"
-	"os"
-	"os/exec"
-	"os/signal"
-	"regexp"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"syscall"
-	"time"
+  "bufio"
+  "bytes"
+  "context"
+  "crypto/sha256"
+  "database/sql"
+  "encoding/hex"
+  "encoding/json"
+  "fmt"
+  "io"
+  "log"
+  "net"
+  "net/http"
+  "os"
+  "os/exec"
+  "os/signal"
+  "regexp"
+  "strings"
+  "sync"
+  "sync/atomic"
+  "syscall"
+  "time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
+  "github.com/docker/docker/api/types/container"
+  "github.com/docker/docker/client"
+  "github.com/docker/docker/pkg/stdcopy"
+  _ "github.com/mattn/go-sqlite3"
 )
 
-// --- STRUCTURES DE CONFIGURATION & MÉTRIQUES ---
-
 type Config struct {
-	ClientName         string   `json:"client_name"`
-	TargetContainer    string   `json:"target_container"`
-	OllamaURL          string   `json:"ollama_url"`
-	LLMModel           string   `json:"llm_model"`
-	DiscordWebhook     string   `json:"discord_webhook"`
-	BanDurationMinutes int      `json:"ban_duration_minutes"`
-	MetricsPort        string   `json:"metrics_port"`
-	WhitelistedIPs     []string `json:"whitelisted_ips"`
-	RegexPattern       string   `json:"regex_pattern"`
+  ClientName         string   `json:"client_name"`
+  TargetContainer    string   `json:"target_container"`
+  OllamaURL          string   `json:"ollama_url"`
+  LLMModel           string   `json:"llm_model"`
+  DiscordWebhook     string   `json:"discord_webhook"`
+  BanDurationMinutes int      `json:"ban_duration_minutes"`
+  MetricsPort        string   `json:"metrics_port"`
+  APIKey             string   `json:"api_key"`
+  DBPath             string   `json:"db_path"`
+  WhitelistedIPs     []string `json:"whitelisted_ips"`
+  RegexPattern       string   `json:"regex_pattern"`
 }
 
 type Metrics struct {
-	LogsProcessed uint64 `json:"logs_processed"`
-	RegexHits     uint64 `json:"regex_hits"`
-	CacheHits     uint64 `json:"cache_hits"`
-	LLMCalls      uint64 `json:"llm_calls"`
-	ActiveBans    int64  `json:"active_bans"`
+  LogsProcessed uint64 `json:"logs_processed"`
+  RegexHits     uint64 `json:"regex_hits"`
+  CacheHits     uint64 `json:"cache_hits"`
+  LLMCalls      uint64 `json:"llm_calls"`
+  ActiveBans    int64  `json:"active_bans"`
 }
 
-type OllamaRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+type ThreatEvent struct {
+  ID        int    `json:"id"`
+  Timestamp string `json:"timestamp"`
+  IP        string `json:"ip"`
+  URI       string `json:"uri"`
+  Engine    string `json:"engine"`
+  Active    bool   `json:"active"`
 }
-
-type OllamaResponse struct {
-	Response string `json:"response"`
-}
-
-type DiscordMessage struct {
-	Embeds []Embed `json:"embeds"`
-}
-
-type Embed struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Color       int    `json:"color"`
-	Timestamp   string `json:"timestamp"`
-}
-
-// --- ÉTAT GLOBAL THREAD-SAFE ---
 
 var (
-	AppConfig     Config
-	AppMetrics    Metrics
-	BannedIPs     sync.Map // map[string]time.Time (Anti-flood Iptables)
-	PayloadCache  sync.Map // map[string]bool      (Cache sémantique SHA-256 : true = MENACE)
-	WhitelistMap  map[string]bool
-	CompiledRegex *regexp.Regexp
-	HttpClient    = &http.Client{Timeout: 30 * time.Second}
+  AppConfig    Config
+  AppMetrics   Metrics
+  BannedIPs    sync.Map
+  PayloadCache sync.Map
+  WhitelistMap map[string]bool
+  CompRegex    *regexp.Regexp
+  HttpClient   = &http.Client{Timeout: 1 * time.Second}
+  DB           *sql.DB
 )
 
-// --- INITIALISATION ---
-
-func loadConfig(path string) {
-	file, err := os.ReadFile(path)
-	if err != nil {
-		log.Fatalf("[FATAL] Lecture configuration impossible (%s) : %v", path, err)
-	}
-	if err := json.Unmarshal(file, &AppConfig); err != nil {
-		log.Fatalf("[FATAL] JSON invalide dans %s : %v", path, err)
-	}
-
-	WhitelistMap = make(map[string]bool)
-	for _, ip := range AppConfig.WhitelistedIPs {
-		WhitelistMap[ip] = true
-	}
-
-	var regexErr error
-	CompiledRegex, regexErr = regexp.Compile(AppConfig.RegexPattern)
-	if regexErr != nil {
-		log.Fatalf("[FATAL] Compilation Regex échouée : %v", regexErr)
-	}
-
-	log.Printf("[INIT] Client: %s | Modèle: %s | Cible: %s", AppConfig.ClientName, AppConfig.LLMModel, AppConfig.TargetContainer)
+func loadConfig() {
+  file, err := os.ReadFile("/etc/sentinel/config.json")
+  if err != nil {
+    log.Fatalf("[FATAL] Config: %v", err)
+  }
+  if err := json.Unmarshal(file, &AppConfig); err != nil {
+    log.Fatalf("[FATAL] JSON: %v", err)
+  }
+  WhitelistMap = make(map[string]bool)
+  for _, ip := range AppConfig.WhitelistedIPs {
+    WhitelistMap[ip] = true
+  }
+  CompRegex = regexp.MustCompile(AppConfig.RegexPattern)
+  log.Printf("[INIT] Client: %s | Cible: %s", AppConfig.ClientName, AppConfig.TargetContainer)
 }
 
-// --- UTILITAIRES DE SÉCURITÉ ---
-
-func extractValidIP(logLine string) (string, bool) {
-	parts := strings.Split(strings.TrimSpace(logLine), " ")
-	if len(parts) == 0 {
-		return "", false
-	}
-	rawIP := parts[0]
-	parsedIP := net.ParseIP(rawIP)
-	if parsedIP == nil {
-		return "", false
-	}
-	return parsedIP.String(), true
+func initDB() {
+  var err error
+  DB, err = sql.Open("sqlite3", AppConfig.DBPath)
+  if err != nil {
+    log.Fatalf("[FATAL] SQLite: %v", err)
+  }
+  q := `CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    ip TEXT, uri TEXT, engine TEXT, active BOOLEAN DEFAULT 1
+  );`
+  if _, err := DB.Exec(q); err != nil {
+    log.Fatalf("[FATAL] Table: %v", err)
+  }
 }
 
-func extractRequestURI(logLine string) string {
-	// Extrait uniquement la requête HTTP (ex: "GET /ping?ip=... HTTP/1.1") pour le cache sémantique
-	firstQuote := strings.Index(logLine, "\"")
-	if firstQuote == -1 {
-		return logLine
-	}
-	secondQuote := strings.Index(logLine[firstQuote+1:], "\"")
-	if secondQuote == -1 {
-		return logLine
-	}
-	return logLine[firstQuote+1 : firstQuote+1+secondQuote]
+func resetChain() {
+  _ = exec.Command("iptables", "-F", "DOCKER-USER").Run()
+  _ = exec.Command("iptables", "-A", "DOCKER-USER", "-j", "RETURN").Run()
+  atomic.StoreInt64(&AppMetrics.ActiveBans, 0)
+  log.Println("[KERNEL INIT] DOCKER-USER reinitialisee.")
 }
 
-func hashString(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
-}
+func executeBan(ip, uri, engine string) {
+  if exec.Command("iptables", "-C", "DOCKER-USER", "-s", ip, "-j", "DROP").Run() == nil {
+    return
+  }
+  if err := exec.Command("iptables", "-I", "DOCKER-USER", "1", "-s", ip, "-j", "DROP").Run(); err != nil {
+    BannedIPs.Delete(ip)
+    return
+  }
+  atomic.AddInt64(&AppMetrics.ActiveBans, 1)
+  _, _ = DB.Exec(`INSERT INTO events (ip, uri, engine, active) VALUES (?, ?, ?, 1)`, ip, uri, engine)
+  log.Printf("[L3 BAN] IP %s radiee (Moteur: %s)", ip, engine)
 
-// --- COUCHE 1 : INTERCEPTION SOCKET DOCKER ---
-
-func monitorContainer(ctx context.Context, cli *client.Client, alertChan chan<- string) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			options := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true, Tail: "0"}
-			out, err := cli.ContainerLogs(ctx, AppConfig.TargetContainer, options)
-			if err != nil {
-				log.Printf("[ERREUR L1] Connexion conteneur %s échouée : %v. Nouvel essai dans 5s...", AppConfig.TargetContainer, err)
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
-			log.Printf("[L1] Écoute active sur le socket de %s", AppConfig.TargetContainer)
-			buf := make([]byte, 8192)
-
-			for {
-				n, err := out.Read(buf)
-				if n > 8 {
-					logChunk := string(buf[8:n])
-					lines := strings.Split(logChunk, "\n")
-					for _, line := range lines {
-						line = strings.TrimSpace(line)
-						if line == "" {
-							continue
-						}
-						atomic.AddUint64(&AppMetrics.LogsProcessed, 1)
-
-						if CompiledRegex.MatchString(line) {
-							atomic.AddUint64(&AppMetrics.RegexHits, 1)
-							alertChan <- line
-						}
-					}
-				}
-				if err != nil {
-					if err != io.EOF {
-						log.Printf("[WARN L1] Flux interrompu : %v", err)
-					}
-					out.Close()
-					break
-				}
-			}
-			time.Sleep(2 * time.Second)
-		}
-	}
-}
-
-// --- COUCHE 2 : ANALYSE COGNITIVE & CACHE SÉMANTIQUE ---
-
-func processThreat(logLine string) {
-	attackerIP, valid := extractValidIP(logLine)
-	if !valid {
-		log.Printf("[WARN] IP invalide ignorée dans le log : %s", logLine)
-		return
-	}
-
-	if WhitelistMap[attackerIP] {
-		log.Printf("[WHITELIST] IP protégée ignorée : %s", attackerIP)
-		return
-	}
-
-	// Déduplication immédiate : si l'IP est déjà bannie ou en cours de traitement, on ignore
-	if _, alreadyBanned := BannedIPs.LoadOrStore(attackerIP, time.Now()); alreadyBanned {
-		return
-	}
-
-	requestURI := extractRequestURI(logLine)
-	payloadHash := hashString(requestURI)
-
-	// 1. Vérification du Cache Sémantique (0 latence, 0 appel LLM)
-	if cachedDecision, found := PayloadCache.Load(payloadHash); found {
-		atomic.AddUint64(&AppMetrics.CacheHits, 1)
-		if cachedDecision.(bool) {
-			log.Printf("[⚡ CACHE HIT L2] Attaque connue détectée (%s). Frappe immédiate.", attackerIP)
-			executeKernelBan(attackerIP, requestURI, "Cache Sémantique (SHA-256)")
-		} else {
-			BannedIPs.Delete(attackerIP)
-		}
-		return
-	}
-
-	// 2. Appel LLM Local (Ollama)
-	atomic.AddUint64(&AppMetrics.LLMCalls, 1)
-	prompt := fmt.Sprintf(`Tu es un WAF réseau strict. Analyse cette requête HTTP : "%s".
-RÈGLES : Décode l'URL. Injections de commandes (id, whoami, wget, curl), Path Traversal (/etc/passwd) ou SQLi = MENACE.
-Réponds UNIQUEMENT par le mot "MENACE" ou "SAIN".`, requestURI)
-
-	reqBody, _ := json.Marshal(OllamaRequest{
-		Model:  AppConfig.LLMModel,
-		Prompt: prompt,
-		Stream: false,
-	})
-
-	resp, err := HttpClient.Post(AppConfig.OllamaURL, "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		log.Printf("[CIRCUIT BREAKER L2] Ollama injoignable : %v", err)
-		BannedIPs.Delete(attackerIP) // Libère le verrou en cas de panne IA
-		return
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	var llmResp OllamaResponse
-	if err := json.Unmarshal(body, &llmResp); err != nil {
-		BannedIPs.Delete(attackerIP)
-		return
-	}
-
-	decision := strings.ToUpper(llmResp.Response)
-	isThreat := strings.Contains(decision, "MENACE")
-
-	// Enregistrement dans le cache sémantique pour les futures requêtes
-	PayloadCache.Store(payloadHash, isThreat)
-
-	if isThreat {
-		log.Printf("[☠️ L2 CONFIRMÉ] Jugement IA : MENACE pour %s", attackerIP)
-		executeKernelBan(attackerIP, requestURI, fmt.Sprintf("IA Locale (%s)", AppConfig.LLMModel))
-	} else {
-		log.Printf("[✅ L2 SAIN] Faux positif écarté pour %s", attackerIP)
-		BannedIPs.Delete(attackerIP)
-	}
-}
-
-// --- COUCHE 3 : FRAPPE KERNEL IPTABLES & TTL ---
-
-func executeKernelBan(ip string, uri string, engine string) {
-	// Vérifie l'idempotence (ne pas insérer si la règle existe déjà dans le noyau)
-	checkCmd := exec.Command("sudo", "iptables", "-C", "DOCKER-USER", "-s", ip, "-j", "DROP")
-	if err := checkCmd.Run(); err == nil {
-		log.Printf("[L3] L'IP %s est déjà présente dans DOCKER-USER.", ip)
-		return
-	}
-
-	insertCmd := exec.Command("sudo", "iptables", "-I", "DOCKER-USER", "1", "-s", ip, "-j", "DROP")
-	if err := insertCmd.Run(); err != nil {
-		log.Printf("[ERREUR KERNEL L3] Échec iptables pour %s : %v", ip, err)
-		BannedIPs.Delete(ip)
-		return
-	}
-
-	atomic.AddInt64(&AppMetrics.ActiveBans, 1)
-	log.Printf("[🛡️ L3 EXÉCUTÉ] Entité %s radiée (Moteur: %s).", ip, engine)
-
-	go notifyDiscord(ip, uri, engine)
-
-	// Programmation de l'Auto-Unban (TTL) si configuré (> 0)
-	if AppConfig.BanDurationMinutes > 0 {
-		duration := time.Duration(AppConfig.BanDurationMinutes) * time.Minute
-		time.AfterFunc(duration, func() {
-			unbanIP(ip)
-		})
-	}
+  if AppConfig.BanDurationMinutes > 0 {
+    time.AfterFunc(time.Duration(AppConfig.BanDurationMinutes)*time.Minute, func() {
+      unbanIP(ip)
+    })
+  }
 }
 
 func unbanIP(ip string) {
-	delCmd := exec.Command("sudo", "iptables", "-D", "DOCKER-USER", "-s", ip, "-j", "DROP")
-	if err := delCmd.Run(); err == nil {
-		atomic.AddInt64(&AppMetrics.ActiveBans, -1)
-		log.Printf("[♻️ TTL EXPIRÉ] L'entité %s a été retirée de DOCKER-USER.", ip)
-	}
-	BannedIPs.Delete(ip)
+  removed := false
+  for exec.Command("iptables", "-D", "DOCKER-USER", "-s", ip, "-j", "DROP").Run() == nil {
+    removed = true
+  }
+  if removed {
+    if atomic.AddInt64(&AppMetrics.ActiveBans, -1) < 0 {
+      atomic.StoreInt64(&AppMetrics.ActiveBans, 0)
+    }
+    log.Printf("[UNBAN] IP %s liberee.", ip)
+  }
+  _, _ = DB.Exec(`UPDATE events SET active = 0 WHERE ip = ?`, ip)
+  BannedIPs.Delete(ip)
 }
 
-// --- OBSERVABILITÉ & API B2B ---
+func processThreat(line string) {
+  parts := strings.Split(strings.TrimSpace(line), " ")
+  if len(parts) == 0 {
+    return
+  }
+  parsed := net.ParseIP(parts[0])
+  if parsed == nil {
+    return
+  }
+  ip := parsed.String()
+  if WhitelistMap[ip] {
+    return
+  }
+  if _, loaded := BannedIPs.LoadOrStore(ip, time.Now()); loaded {
+    return
+  }
 
-func notifyDiscord(ip string, uri string, engine string) {
-	if AppConfig.DiscordWebhook == "" || strings.Contains(AppConfig.DiscordWebhook, "TON_LIEN") {
-		return
-	}
+  uri := line
+  if q1 := strings.Index(line, "\""); q1 != -1 {
+    if q2 := strings.Index(line[q1+1:], "\""); q2 != -1 {
+      uri = line[q1+1 : q1+1+q2]
+    }
+  }
+  sum := sha256.Sum256([]byte(uri))
+  hash := hex.EncodeToString(sum[:])
 
-	msg := DiscordMessage{
-		Embeds: []Embed{
-			{
-				Title: "🚨 SENTINEL-ZERO : MENACE NEUTRALISÉE",
-				Description: fmt.Sprintf(
-					"**Client :** `%s`\n**IP Hostile :** `%s`\n**Payload :** `%s`\n**Validation :** `%s`\n**Sanction :** `DROP (DOCKER-USER)`\n**TTL :** `%d min`",
-					AppConfig.ClientName, ip, uri, engine, AppConfig.BanDurationMinutes,
-				),
-				Color:     16711680,
-				Timestamp: time.Now().Format(time.RFC3339),
-			},
-		},
-	}
+  if cached, ok := PayloadCache.Load(hash); ok {
+    atomic.AddUint64(&AppMetrics.CacheHits, 1)
+    if cached.(bool) {
+      log.Printf("[CACHE HIT L2] Menace connue (%s).", ip)
+      executeBan(ip, uri, "Cache SHA-256")
+    } else {
+      BannedIPs.Delete(ip)
+    }
+    return
+  }
 
-	body, _ := json.Marshal(msg)
-	_, err := HttpClient.Post(AppConfig.DiscordWebhook, "application/json", bytes.NewBuffer(body))
-	if err != nil {
-		log.Printf("[WARN DISCORD] Échec envoi webhook : %v", err)
-	}
+  atomic.AddUint64(&AppMetrics.LLMCalls, 1)
+  reqData, _ := json.Marshal(map[string]any{
+    "model":   AppConfig.LLMModel,
+    "prompt":  fmt.Sprintf("WAF: '%s'. Exploit/Injection = MENACE. Sinon = SAIN. 1 mot:", uri),
+    "stream":  false,
+    "options": map[string]any{"num_predict": 5, "temperature": 0.0},
+  })
+
+  resp, err := HttpClient.Post(AppConfig.OllamaURL, "application/json", bytes.NewBuffer(reqData))
+  if err != nil {
+    log.Printf("[FALLBACK L2] Ollama HS (%v). Frappe heuristique activee.", err)
+    PayloadCache.Store(hash, true)
+    executeBan(ip, uri, "Heuristique L2")
+    return
+  }
+  defer resp.Body.Close()
+
+  body, _ := io.ReadAll(resp.Body)
+  var out struct {
+    Response string `json:"response"`
+  }
+  _ = json.Unmarshal(body, &out)
+
+  ans := strings.ToUpper(strings.TrimSpace(out.Response))
+  isThreat := ans == "" || strings.Contains(ans, "MENACE") || !strings.Contains(ans, "SAIN")
+  PayloadCache.Store(hash, isThreat)
+
+  if isThreat {
+    executeBan(ip, uri, "Llama 3.2")
+  } else {
+    BannedIPs.Delete(ip)
+  }
 }
 
-func startMetricsServer() {
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		data := map[string]interface{}{
-			"client":  AppConfig.ClientName,
-			"status":  "OPERATIONAL",
-			"metrics": AppMetrics,
-		}
-		json.NewEncoder(w).Encode(data)
-	})
-	log.Printf("[API B2B] Télémétrie exposée sur http://%s/metrics", AppConfig.MetricsPort)
-	if err := http.ListenAndServe(AppConfig.MetricsPort, nil); err != nil {
-		log.Printf("[WARN API] Serveur métriques arrêté : %v", err)
-	}
+func monitor(ctx context.Context, cli *client.Client) {
+  for {
+    select {
+    case <-ctx.Done():
+      return
+    default:
+      opts := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true, Tail: "0"}
+      out, err := cli.ContainerLogs(ctx, AppConfig.TargetContainer, opts)
+      if err != nil {
+        time.Sleep(3 * time.Second)
+        continue
+      }
+      log.Printf("[L1] Ecoute stdcopy active sur %s", AppConfig.TargetContainer)
+      pr, pw := io.Pipe()
+      go func() {
+        _, _ = stdcopy.StdCopy(pw, pw, out)
+        pw.Close()
+      }()
+      sc := bufio.NewScanner(pr)
+      for sc.Scan() {
+        line := strings.TrimSpace(sc.Text())
+        if line == "" {
+          continue
+        }
+        atomic.AddUint64(&AppMetrics.LogsProcessed, 1)
+        if CompRegex.MatchString(line) {
+          atomic.AddUint64(&AppMetrics.RegexHits, 1)
+          log.Printf("[L1 REGEX] Suspect: %s", line)
+          go processThreat(line)
+        }
+      }
+      out.Close()
+      pr.Close()
+      time.Sleep(2 * time.Second)
+    }
+  }
 }
 
-// --- ORCHESTRATEUR PRINCIPAL ---
+func auth(next http.HandlerFunc) http.HandlerFunc {
+  return func(w http.ResponseWriter, r *http.Request) {
+    tok := r.URL.Query().Get("token")
+    if tok == "" {
+      h := r.Header.Get("Authorization")
+      if strings.HasPrefix(h, "Bearer ") {
+        tok = strings.TrimPrefix(h, "Bearer ")
+      }
+    }
+    if tok != AppConfig.APIKey {
+      w.Header().Set("Content-Type", "application/json")
+      w.WriteHeader(http.StatusUnauthorized)
+      _, _ = w.Write([]byte(`{"error":"Unauthorized"}`))
+      return
+    }
+    next.ServeHTTP(w, r)
+  }
+}
 
 func main() {
-	loadConfig("/etc/sentinel/config.json")
+  loadConfig()
+  initDB()
+  resetChain()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+  ctx, cancel := context.WithCancel(context.Background())
+  defer cancel()
 
-	// Gestion de l'arrêt propre (Systemd SIGTERM / Ctrl+C)
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+  cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+  if err != nil {
+    log.Fatalf("[FATAL] Docker: %v", err)
+  }
+  go monitor(ctx, cli)
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		log.Fatalf("[FATAL] Initialisation client Docker échouée : %v", err)
-	}
+  http.HandleFunc("/api/metrics", auth(func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    rows, _ := DB.Query(`SELECT id, timestamp, ip, uri, engine, active FROM events ORDER BY id DESC LIMIT 50`)
+    evts := []ThreatEvent{}
+    for rows != nil && rows.Next() {
+      var e ThreatEvent
+      _ = rows.Scan(&e.ID, &e.Timestamp, &e.IP, &e.URI, &e.Engine, &e.Active)
+      evts = append(evts, e)
+    }
+    if rows != nil {
+      rows.Close()
+    }
+    _ = json.NewEncoder(w).Encode(map[string]any{
+      "client":  AppConfig.ClientName,
+      "status":  "OPERATIONAL",
+      "metrics": AppMetrics,
+      "events":  evts,
+    })
+  }))
 
-	go startMetricsServer()
+  http.HandleFunc("/api/unban", auth(func(w http.ResponseWriter, r *http.Request) {
+    ip := r.URL.Query().Get("ip")
+    if net.ParseIP(ip) == nil {
+      http.Error(w, `{"error":"Invalid IP"}`, http.StatusBadRequest)
+      return
+    }
+    unbanIP(ip)
+    w.Header().Set("Content-Type", "application/json")
+    _, _ = w.Write([]byte(`{"status":"unbanned","ip":"` + ip + `"}`))
+  }))
 
-	alertChan := make(chan string, 1000)
-	go monitorContainer(ctx, cli, alertChan)
+  go func() {
+    log.Printf("[CONTROL PLANE V5.1] Actif sur http://%s", AppConfig.MetricsPort)
+    _ = http.ListenAndServe(AppConfig.MetricsPort, nil)
+  }()
 
-	log.Println("[SENTINEL-ZERO V4.0] Système Enterprise actif.")
-
-	for {
-		select {
-		case threatLine := <-alertChan:
-			go processThreat(threatLine)
-		case sig := <-sigChan:
-			log.Printf("[SHUTDOWN] Signal %v reçu. Arrêt propre de l'agent...", sig)
-			cancel()
-			time.Sleep(1 * time.Second)
-			return
-		}
-	}
+  sigChan := make(chan os.Signal, 1)
+  signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+  <-sigChan
+  resetChain()
 }
