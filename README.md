@@ -1,4 +1,4 @@
-# Sentinel-Zero (Enterprise Edition)
+# Sentinel-Zero 
 Agent SRE/DevSecOps autonome en Golang.
 
 ## Architecture V4.0
