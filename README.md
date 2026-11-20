@@ -5,6 +5,7 @@
 ![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)
 ![Plateforme](https://img.shields.io/badge/plateforme-Linux-lightgrey?logo=linux&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-requis-2496ED?logo=docker&logoColor=white)
+![CI](https://github.com/snisharahamad/docker-ban-daemon/actions/workflows/ci.yml/badge.svg)
 
 ## Sommaire
 
