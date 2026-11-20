@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-go
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: agent-go/go.mod
+          cache-dependency-path: agent-go/go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests (race detector + coverage)
+        run: CGO_ENABLED=1 go test -v -race -cover ./...
+
+      - name: Build binary
+        run: CGO_ENABLED=1 go build -o dockban .
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          working-directory: agent-go
+          version: v2.15

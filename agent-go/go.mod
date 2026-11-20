@@ -1,4 +1,4 @@
-module github.com/snisharahamad/sentinel-zero/agent-go
+module github.com/snisharahamad/docker-ban-daemon/agent-go
 
 go 1.26.0
 
