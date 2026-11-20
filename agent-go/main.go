@@ -72,7 +72,7 @@ var (
 )
 
 func loadConfig() {
-  file, err := os.ReadFile("/etc/sentinel/config.json")
+  file, err := os.ReadFile("/etc/dockban/config.json")
   if err != nil {
     log.Fatalf("[FATAL] Config: %v", err)
   }
