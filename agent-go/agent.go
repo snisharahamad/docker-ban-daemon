@@ -76,6 +76,7 @@ type Agent struct {
 	whitelist  map[string]bool
 	httpClient *http.Client
 	metrics    Metrics
+	prom       *PromMetrics
 
 	bannedIPs sync.Map
 	cacheMu   sync.RWMutex
@@ -88,8 +89,6 @@ func initDB(dbPath string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ouverture SQLite: %w", err)
 	}
-	// SQLite ne supporte qu'un seul écrivain simultané : évite les erreurs "database is locked"
-	// et garantit que ":memory:" dans les tests partage la même base.
 	db.SetMaxOpenConns(1)
 
 	const schema = `CREATE TABLE IF NOT EXISTS events (
@@ -140,6 +139,7 @@ func NewAgent(cfg Config, db *sql.DB, fw Firewall) (*Agent, error) {
 		regex:      compRegex,
 		whitelist:  whitelist,
 		httpClient: &http.Client{Timeout: 1 * time.Second},
+		prom:       newPromMetrics(),
 		cache:      make(map[string]bool),
 		sem:        make(chan struct{}, maxConcurrentAnalyses),
 	}, nil
@@ -150,6 +150,7 @@ func (a *Agent) ResetFirewall() error {
 		return err
 	}
 	a.metrics.ActiveBans.Store(0)
+	a.prom.activeBans.Set(0)
 	log.Println("[KERNEL] Chaîne DOCKER-USER réinitialisée.")
 	return nil
 }
@@ -175,13 +176,11 @@ func (a *Agent) setCache(hash string, isThreat bool) {
 	a.cacheMu.Lock()
 	defer a.cacheMu.Unlock()
 	if len(a.cache) >= maxCacheEntries {
-		// Réinitialisation simple pour borner la RAM sans dépendance externe.
 		clear(a.cache)
 	}
 	a.cache[hash] = isThreat
 }
 
-// extractIPAndURI extrait l'IPv4 source (1re colonne CLF) et la requête HTTP entre guillemets.
 func extractIPAndURI(line string) (string, string, bool) {
 	fields := strings.Fields(line)
 	if len(fields) == 0 {
@@ -190,7 +189,6 @@ func extractIPAndURI(line string) (string, string, bool) {
 
 	parsed := net.ParseIP(fields[0])
 	if parsed == nil || parsed.To4() == nil {
-		// iptables ne gère que l'IPv4 (IPv6 nécessiterait ip6tables).
 		return "", "", false
 	}
 
@@ -211,11 +209,13 @@ func (a *Agent) HandleLogLine(ctx context.Context, line string) {
 	}
 
 	a.metrics.LogsProcessed.Add(1)
+	a.prom.logsProcessed.Inc()
 	if !a.regex.MatchString(line) {
 		return
 	}
 
 	a.metrics.RegexHits.Add(1)
+	a.prom.regexHits.Inc()
 	log.Printf("[L1 REGEX] Ligne suspecte: %s", line)
 
 	select {
@@ -247,31 +247,37 @@ func (a *Agent) processThreat(ctx context.Context, line string) {
 	if isThreat, found := a.getCache(hash); found {
 		a.metrics.CacheHits.Add(1)
 		if isThreat {
+			a.prom.decisions.WithLabelValues("cache", "threat").Inc()
 			log.Printf("[CACHE HIT L2] Menace connue (%s).", ip)
 			a.executeBan(ip, uri, "Cache SHA-256")
 		} else {
+			a.prom.decisions.WithLabelValues("cache", "benign").Inc()
 			a.bannedIPs.Delete(ip)
 		}
 		return
 	}
 
 	a.metrics.LLMCalls.Add(1)
+	start := time.Now()
 	isThreat, err := a.classifyWithLLM(ctx, uri)
+	a.prom.llmDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
+		a.prom.decisions.WithLabelValues("heuristic", "threat").Inc()
 		log.Printf("[FALLBACK L2] Ollama indisponible (%v), blocage heuristique appliqué.", err)
-		// On ne met pas en cache un fallback d'erreur pour éviter d'empoisonner le cache.
 		a.executeBan(ip, uri, "Heuristique L2")
 		return
 	}
 
 	a.setCache(hash, isThreat)
 	if isThreat {
+		a.prom.decisions.WithLabelValues("llm", "threat").Inc()
 		engine := a.cfg.LLMModel
 		if engine == "" {
 			engine = "LLM"
 		}
 		a.executeBan(ip, uri, engine)
 	} else {
+		a.prom.decisions.WithLabelValues("llm", "benign").Inc()
 		a.bannedIPs.Delete(ip)
 	}
 }
@@ -328,6 +334,7 @@ func (a *Agent) executeBan(ip, uri, engine string) {
 	}
 
 	a.metrics.ActiveBans.Add(1)
+	a.prom.activeBans.Inc()
 	if _, err := a.db.Exec(
 		`INSERT INTO events (ip, uri, engine, active) VALUES (?, ?, ?, 1)`,
 		ip, uri, engine,
@@ -356,6 +363,7 @@ func (a *Agent) unbanIP(ip string) {
 				break
 			}
 			if a.metrics.ActiveBans.CompareAndSwap(cur, cur-1) {
+				a.prom.activeBans.Set(float64(cur - 1))
 				break
 			}
 		}
@@ -370,6 +378,7 @@ func (a *Agent) unbanIP(ip string) {
 
 func (a *Agent) Routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", a.authMiddleware(a.prom.Handler().ServeHTTP))
 	mux.HandleFunc("/api/metrics", a.authMiddleware(a.handleMetrics))
 	mux.HandleFunc("/api/unban", a.authMiddleware(a.handleUnban))
 	return mux
