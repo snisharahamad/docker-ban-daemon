@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "dockban"
+    metrics_path: "/metrics"
+    authorization:
+      type: "Bearer"
+      credentials_file: "/etc/prometheus/dockban_token"
+    static_configs:
+      - targets: ["host.docker.internal:9101"]

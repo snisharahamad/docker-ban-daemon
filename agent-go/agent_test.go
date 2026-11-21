@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"strings"
 )
 
 type mockFirewall struct {
@@ -330,4 +331,44 @@ func TestConcurrentProcessThreatAndMetrics(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestPrometheusMetricsEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"response":"MENACE"}`))
+	}))
+	defer srv.Close()
+
+	agent, _ := newTestAgent(t, srv.URL)
+	agent.processThreat(context.Background(), `203.0.113.55 - - "GET /ping?ip=1;id HTTP/1.1" 200`)
+
+	handler := agent.Routes()
+
+	// Sans token -> 401
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/metrics sans token: statut = %d, attendu 401", rec.Code)
+	}
+
+	// Avec Bearer valide -> 200 et métriques Prometheus présentes
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer super-secret-test-key")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics avec token: statut = %d, attendu 200", rec.Code)
+	}
+
+	body := rec.Body.String()
+	for _, want := range []string{
+		`dockban_decisions_total{engine="llm",verdict="threat"} 1`,
+		`dockban_active_bans 1`,
+		`dockban_llm_duration_seconds_count 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("métrique attendue absente (%s) dans:\n%s", want, body)
+		}
+	}
 }

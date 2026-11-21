@@ -1,0 +1,39 @@
+services:
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: dockban-prometheus
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:172.28.0.1"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./dockban_token:/etc/prometheus/dockban_token:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: dockban-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=dockban-admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring
+
+networks:
+  monitoring:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          gateway: 172.28.0.1
